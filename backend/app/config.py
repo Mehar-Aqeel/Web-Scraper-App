@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     MAX_RETRIES: int = 1
     GLOBAL_CONCURRENCY_LIMIT: int = 20
     CACHE_TTL_SECONDS: int = 300
+    # Override via DATABASE_URL env var in production — never commit real credentials here.
+    # Default is a local SQLite file suitable for development only.
+    DATABASE_URL: str = "sqlite+aiosqlite:///./webextractor.db"
 
     def allowed_origins_list(self) -> List[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",")]

@@ -37,6 +37,8 @@ logger = structlog.get_logger()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.services.database import init_db
+    await init_db()
     logger.info("startup", env=settings.APP_ENV)
     yield
     logger.info("shutdown")
