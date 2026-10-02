@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import structlog
 from bs4 import BeautifulSoup
@@ -39,12 +40,79 @@ class RobotsDisallowedError(Exception):
     """Raised when robots.txt explicitly disallows the target URL."""
 
 
+async def extract_js_async(
+    job_id: str,
+    url: str,
+    selected: list[ExtractionType],
+) -> None:
+    """Run a Playwright extraction job in the background, updating job store progress."""
+    from app.services.job_store import get_job
+    from app.services.playwright_fetcher import fetch_page_js
+
+    job = get_job(job_id)
+    if job is None:
+        return
+
+    job.status = "running"
+    job.push("starting", 5)
+
+    async def _progress(stage: str, pct: int) -> None:
+        job.push(stage, pct)
+
+    try:
+        robots = await check_robots(url)
+        if not robots.allowed:
+            raise RobotsDisallowedError(f"robots.txt disallows scraping {url}")
+        if robots.warning:
+            job.warnings.append(robots.warning)
+
+        job.push("fetching", 15)
+        html = await fetch_page_js(url, _progress)
+
+        job.push("extracting", 90)
+        data, parse_warnings = await asyncio.wait_for(
+            _parse_and_extract(html, url, selected),
+            timeout=_PARSE_TIMEOUT_SECONDS,
+        )
+        job.warnings.extend(parse_warnings)
+        job.data = data
+        job.status = "done"
+        job.push("done", 100)
+
+    except Exception as exc:
+        logger.error("js_extraction_error", job_id=job_id, url=url, error=str(exc))
+        job.status = "error"
+        job.error = str(exc)
+        job.push("error", 100)
+    finally:
+        job.finished_at = time.time()
+
+
 class ParseTimeoutError(Exception):
     """Raised when BeautifulSoup parsing/extraction exceeds the time budget."""
 
 
 class ServerBusyError(Exception):
     """Raised when the global concurrency limit is reached."""
+
+
+async def batch_extract(
+    urls: list[str],
+    selected: list[ExtractionType],
+    concurrency: int = 3,
+) -> list[dict]:
+    """Extract *urls* concurrently, returning one result dict per URL."""
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _one(url: str) -> dict:
+        async with sem:
+            try:
+                data, warnings = await extract(url, selected)
+                return {"url": url, "success": True, "data": data, "warnings": warnings}
+            except Exception as exc:
+                return {"url": url, "success": False, "error": str(exc), "data": [], "warnings": []}
+
+    return list(await asyncio.gather(*[_one(u) for u in urls]))
 
 
 async def extract(

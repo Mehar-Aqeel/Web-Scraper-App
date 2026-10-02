@@ -53,11 +53,95 @@ class ExtractRequest(BaseModel):
         return result
 
 
+class CsvExportRequest(BaseModel):
+    data: list[dict[str, Any]]
+
+    @field_validator("data")
+    @classmethod
+    def validate_row_count(cls, v: list) -> list:
+        from app.config import settings
+        if len(v) > settings.MAX_RESULT_ROWS:
+            raise ValueError(
+                f"Row count {len(v)} exceeds the maximum allowed export size of {settings.MAX_RESULT_ROWS}."
+            )
+        return v
+
+
 class ExtractResponse(BaseModel):
     success: bool
     url: str
     data: list[dict[str, Any]]
     warnings: list[str]
+    next_cursor: str | None = None
+
+
+class BatchExtractRequest(BaseModel):
+    urls: list[str]
+    extract: list[ExtractionType]
+
+    @field_validator("urls")
+    @classmethod
+    def validate_urls(cls, v: list[str]) -> list[str]:
+        from urllib.parse import urlparse
+        if not v:
+            raise ValueError("At least one URL must be provided.")
+        if len(v) > 20:
+            raise ValueError("Maximum 20 URLs per batch request.")
+        for url in v:
+            if len(url) > MAX_URL_LENGTH:
+                raise ValueError(f"URL exceeds maximum length: {url[:80]}")
+            parsed = urlparse(url)
+            if parsed.scheme not in ALLOWED_SCHEMES:
+                raise ValueError(f"Invalid URL scheme in: {url[:80]}")
+        return v
+
+    @field_validator("extract")
+    @classmethod
+    def validate_extract(cls, v: list[ExtractionType]) -> list[ExtractionType]:
+        if not v:
+            raise ValueError("At least one extraction type must be selected.")
+        seen: set[ExtractionType] = set()
+        return [x for x in v if not (seen.add(x) or x in seen - {x})]
+
+
+class BatchResultItem(BaseModel):
+    url: str
+    success: bool
+    data: list[dict[str, Any]]
+    warnings: list[str]
+    error: str | None = None
+
+
+class BatchExtractResponse(BaseModel):
+    results: list[BatchResultItem]
+
+
+class ExportRequest(BaseModel):
+    data: list[dict[str, Any]]
+
+    @field_validator("data")
+    @classmethod
+    def validate_row_count(cls, v: list) -> list:
+        from app.config import settings
+        if len(v) > settings.MAX_RESULT_ROWS:
+            raise ValueError(f"Row count {len(v)} exceeds maximum export size of {settings.MAX_RESULT_ROWS}.")
+        return v
+
+
+class JobResponse(BaseModel):
+    job_id: str
+    status: str
+    url: str
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    stage: str
+    progress: int
+    data: list[dict[str, Any]]
+    warnings: list[str]
+    error: str | None = None
     next_cursor: str | None = None
 
 

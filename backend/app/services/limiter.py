@@ -41,15 +41,26 @@ async def acquire_domain_slot(url: str) -> None:
 # ---------------------------------------------------------------------------
 # TICKET-013a: Global concurrency semaphore
 # ---------------------------------------------------------------------------
-# Lazily initialised so it picks up the settings value at first use.
-_global_semaphore: asyncio.Semaphore | None = None
+
+class _SemaphoreHolder:
+    """Encapsulates the global semaphore to avoid bare global mutation."""
+    _sem: asyncio.Semaphore | None = None
+
+    def get(self) -> asyncio.Semaphore:
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(settings.GLOBAL_CONCURRENCY_LIMIT)
+        return self._sem
+
+    def reset(self) -> None:
+        """Reset for testing."""
+        self._sem = None
+
+
+_semaphore_holder = _SemaphoreHolder()
 
 
 def get_semaphore() -> asyncio.Semaphore:
-    global _global_semaphore
-    if _global_semaphore is None:
-        _global_semaphore = asyncio.Semaphore(settings.GLOBAL_CONCURRENCY_LIMIT)
-    return _global_semaphore
+    return _semaphore_holder.get()
 
 
 # ---------------------------------------------------------------------------

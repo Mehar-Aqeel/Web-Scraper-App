@@ -8,6 +8,7 @@ from app.services.page_fetcher import (
     ContentTypeError,
     ResponseTooLargeError,
 )
+from app.services.fetcher import SSRFError, TooManyRedirectsError
 
 
 # ---------------------------------------------------------------------------
@@ -229,3 +230,108 @@ async def test_no_charset_declaration_does_not_crash(monkeypatch):
         page = await fetch_page("https://example.com/nocharset", _client=client)
     assert "Hello world" in page.html
     assert page.encoding
+
+
+# ---------------------------------------------------------------------------
+# TICKET-032: Meta-refresh redirect following
+# ---------------------------------------------------------------------------
+
+from app.services.page_fetcher import _parse_meta_refresh
+
+
+def test_parse_meta_refresh_returns_absolute_url():
+    html = '<html><head><meta http-equiv="refresh" content="0; url=/new-page"></head></html>'
+    result = _parse_meta_refresh(html, "https://example.com/old")
+    assert result == "https://example.com/new-page"
+
+
+def test_parse_meta_refresh_absolute_url_unchanged():
+    html = '<meta http-equiv="refresh" content="5; url=https://other.com/page">'
+    result = _parse_meta_refresh(html, "https://example.com/")
+    assert result == "https://other.com/page"
+
+
+def test_parse_meta_refresh_returns_none_when_absent():
+    html = "<html><head><title>No refresh</title></head></html>"
+    assert _parse_meta_refresh(html, "https://example.com/") is None
+
+
+def test_parse_meta_refresh_returns_none_for_hash_only():
+    html = '<meta http-equiv="refresh" content="0; url=#">'
+    assert _parse_meta_refresh(html, "https://example.com/") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_follows_meta_refresh(monkeypatch):
+    """A page with a meta-refresh tag should transparently redirect."""
+    _patch_dns_public(monkeypatch)
+
+    refresh_html = (
+        b'<html><head>'
+        b'<meta http-equiv="refresh" content="0; url=https://example.com/final">'
+        b'</head></html>'
+    )
+    final_html = b"<html><title>Final Page</title></html>"
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    router.get("https://example.com/start").mock(
+        return_value=httpx.Response(200, headers={"content-type": "text/html"}, content=refresh_html)
+    )
+    router.get("https://example.com/final").mock(
+        return_value=httpx.Response(200, headers={"content-type": "text/html"}, content=final_html)
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(router.async_handler), follow_redirects=False)
+
+    async with client:
+        page = await fetch_page("https://example.com/start", _client=client)
+
+    assert "Final Page" in page.html
+    assert page.url == "https://example.com/final"
+
+
+@pytest.mark.asyncio
+async def test_meta_refresh_to_private_ip_is_blocked(monkeypatch):
+    """Meta-refresh to a private IP must be blocked by SSRF check."""
+    import socket
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        if host == "internal.corp":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("192.168.1.1", 0))]
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    refresh_html = (
+        b'<html><head>'
+        b'<meta http-equiv="refresh" content="0; url=http://internal.corp/secret">'
+        b'</head></html>'
+    )
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    router.get("https://example.com/start").mock(
+        return_value=httpx.Response(200, headers={"content-type": "text/html"}, content=refresh_html)
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(router.async_handler), follow_redirects=False)
+
+    async with client:
+        with pytest.raises(SSRFError):
+            await fetch_page("https://example.com/start", _client=client)
+
+
+@pytest.mark.asyncio
+async def test_meta_refresh_hop_limit_enforced(monkeypatch):
+    """A chain of meta-refresh redirects exceeding MAX_REDIRECTS must raise."""
+    from app.config import settings
+    _patch_dns_public(monkeypatch)
+
+    router = respx.MockRouter(assert_all_mocked=True, assert_all_called=False)
+    for i in range(settings.MAX_REDIRECTS + 2):
+        next_url = f"https://example.com/step{i + 1}"
+        html = f'<html><head><meta http-equiv="refresh" content="0; url={next_url}"></head></html>'.encode()
+        router.get(f"https://example.com/step{i}").mock(
+            return_value=httpx.Response(200, headers={"content-type": "text/html"}, content=html)
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(router.async_handler), follow_redirects=False)
+    async with client:
+        with pytest.raises(TooManyRedirectsError):
+            await fetch_page("https://example.com/step0", _client=client)

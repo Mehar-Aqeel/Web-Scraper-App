@@ -24,6 +24,24 @@ class RobotsResult:
     warning: str = ""  # non-empty only on fail-open
 
 
+def _parse_robots_response(
+    response: httpx.Response,
+    robots_url: str,
+) -> urllib.robotparser.RobotFileParser | None:
+    """Return a parsed RobotFileParser, or None if the status signals fail-open."""
+    if response.status_code == 404:
+        parser = urllib.robotparser.RobotFileParser()
+        parser.set_url(robots_url)
+        parser.parse([])
+        return parser
+    if response.status_code >= 400:
+        return None  # caller will fail-open with a warning
+    parser = urllib.robotparser.RobotFileParser()
+    parser.set_url(robots_url)
+    parser.parse(response.text.splitlines())
+    return parser
+
+
 async def check_robots(
     url: str,
     _client: httpx.AsyncClient | None = None,
@@ -45,33 +63,23 @@ async def check_robots(
 
     if entry is None or (now - entry.fetched_at) > settings.ROBOTS_CACHE_TTL_SECONDS:
         try:
-            _default_client = _client is None
-            if _default_client:
-                _client = httpx.AsyncClient(
+            if _client is not None:
+                response = await _client.get(robots_url)
+                parser = _parse_robots_response(response, robots_url)
+            else:
+                async with httpx.AsyncClient(
                     timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
                     headers={"User-Agent": settings.SCRAPER_USER_AGENT},
                     follow_redirects=True,
-                )
-            try:
-                response = await _client.get(robots_url)
-            finally:
-                if _default_client:
-                    await _client.aclose()
+                ) as client:
+                    response = await client.get(robots_url)
+                    parser = _parse_robots_response(response, robots_url)
 
-            if response.status_code == 404:
-                # No robots.txt — everything is allowed
-                parser = urllib.robotparser.RobotFileParser()
-                parser.set_url(robots_url)
-                parser.parse([])
-            elif response.status_code >= 400:
+            if parser is None:
                 return RobotsResult(
                     allowed=True,
                     warning=f"robots.txt fetch returned HTTP {response.status_code}; proceeding without check.",
                 )
-            else:
-                parser = urllib.robotparser.RobotFileParser()
-                parser.set_url(robots_url)
-                parser.parse(response.text.splitlines())
 
             _cache[domain] = _CacheEntry(parser=parser, fetched_at=now)
 

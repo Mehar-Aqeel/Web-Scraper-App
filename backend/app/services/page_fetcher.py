@@ -1,16 +1,41 @@
 import re
 from dataclasses import dataclass, field
+from urllib.parse import urljoin
 
 import httpx
 from charset_normalizer import from_bytes
 
 from app.config import settings
-from app.services.fetcher import stream_url
+from app.services.fetcher import SSRFError, TooManyRedirectsError, _resolve_and_check, stream_url
 
-_ALLOWED_CONTENT_TYPES = {"text/html", "application/xhtml+xml"}
+# Matches <meta http-equiv="refresh" content="0; url=https://example.com">
+# Also handles content="5;URL='...'" and content="0;url=..." variants
+_META_REFRESH_RE = re.compile(
+    r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+content=["\']\s*\d+\s*;\s*url=[\'"\s]?([^\'">\s]+)',
+    re.IGNORECASE,
+)
+
+
+def _parse_meta_refresh(html: str, base_url: str) -> str | None:
+    """Return the absolute redirect URL from a meta-refresh tag, or None."""
+    match = _META_REFRESH_RE.search(html[:8192])  # only scan the <head>
+    if not match:
+        return None
+    target = match.group(1).strip("'\"")
+    if not target or target.lower() == "#":
+        return None
+    return urljoin(base_url, target)
 
 # Matches: charset=utf-8  charset="windows-1252"  charset='iso-8859-1'
 _CHARSET_RE = re.compile(r'charset=["\']?([\w-]+)', re.IGNORECASE)
+
+
+_ALLOWED_CONTENT_TYPES = {
+    "text/html",
+    "application/xhtml+xml",
+    "application/xml",
+    "text/xml",
+}
 
 
 class ContentTypeError(Exception):
@@ -66,8 +91,12 @@ def detect_encoding(raw: bytes, content_type_header: str) -> str:
 async def fetch_page(
     url: str,
     _client: httpx.AsyncClient | None = None,
+    _meta_refresh_hops: int = 0,
 ) -> FetchedPage:
     """Fetch *url*, enforce Content-Type and size limits, decode to str.
+
+    Follows <meta http-equiv="refresh"> redirects up to MAX_REDIRECTS hops,
+    applying the same SSRF checks as HTTP redirects.
 
     Pass *_client* in tests to inject a respx-mocked client.
 
@@ -115,5 +144,20 @@ async def fetch_page(
     except (LookupError, UnicodeDecodeError):
         html = raw.decode("utf-8", errors="replace")
         encoding = "utf-8"
+
+    # --- Meta-refresh redirect (TICKET-032) ---------------------------------
+    meta_target = _parse_meta_refresh(html, url)
+    if meta_target:
+        if _meta_refresh_hops >= settings.MAX_REDIRECTS:
+            raise TooManyRedirectsError(
+                f"Exceeded maximum of {settings.MAX_REDIRECTS} meta-refresh redirects."
+            )
+        from urllib.parse import urlparse
+        _resolve_and_check(urlparse(meta_target).hostname or "")  # SSRF check
+        return await fetch_page(
+            meta_target,
+            _client=_client,
+            _meta_refresh_hops=_meta_refresh_hops + 1,
+        )
 
     return FetchedPage(url=url, html=html, encoding=encoding)
